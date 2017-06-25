@@ -1,0 +1,636 @@
+#!/usr/bin/env lua
+
+local uv = require "luv"
+local cjson = require "cjson.safe"
+local tlchecker = require "typedlua.tlchecker"
+local tlparser = require "typedlua.tlparser"
+local tlvisitor = require "typedlua.tlvisitor"
+local log = nil -- io.stderr
+
+local JSON_RPC_VERSION = "2.0"
+
+-- Constants as defined by the JSON-RPC 2.0 specification
+local JSON_RPC_ERROR = {
+	PARSE = {
+		code = -32700,
+		message = "Parse error",
+	},
+	REQUEST = {
+		code = -32600,
+		message = "Invalid request",
+	},
+	UNKNOWN_METHOD = {
+		code = -32601,
+		message = "Unknown method",
+	},
+	INVALID_PARAMS = {
+		code = -32602,
+		message = "Invalid parameters",
+	},
+	INTERNAL_ERROR = {
+		code = -32603,
+		message = "Internal error",
+	},
+	SERVER_NOT_INITALIZED = {
+		code = -32002,
+		message = "Server not initialized",
+	},
+	UNKNOWN_ERROR = {
+		code = -32001,
+		message = "Unknown error"
+	},
+	REQUEST_CANCELLED = {
+		code = -32800,
+		message = "Request Cancelled"
+	},
+	-- -32000 to -32099 is reserved for implementation-defined server-errors
+}
+
+local LSP_ERROR = -32000
+
+-- LSP Protocol constants
+local DiagnosticSeverity = {
+	Error = 1,
+	Warning = 2,
+	Information = 3,
+	Hint = 4,
+}
+
+local TextDocumentSyncKind = {
+	None = 0,
+	Full = 1,
+	Incremental = 2,
+}
+
+local MessageType = {
+	Error = 1,
+	Warning = 2,
+	Info = 3,
+	Log = 4,
+}
+
+local FileChangeType = {
+	Created = 1,
+	Changed = 2,
+	Deleted = 3,
+}
+
+local CompletionItemKind = {
+	Text = 1,
+	Method = 2,
+	Function = 3,
+	Constructor = 4,
+	Field = 5,
+	Variable = 6,
+	Class = 7,
+	Interface = 8,
+	Module = 9,
+	Property = 10,
+	Unit = 11,
+	Value = 12,
+	Enum = 13,
+	Keyword = 14,
+	Snippet = 15,
+	Color = 16,
+	File = 17,
+	Reference = 18,
+}
+
+-- LSP line and character indecies are zero-based
+local function position(line, column)
+	return { line = line-1, character = column-1 }
+end
+
+local function range(s, e)
+	return { start = s, ['end'] = e }
+end
+
+local function log_debug(session, msg)
+	if not log then return end
+	log:write(msg);
+	log:flush()
+end
+
+local log_info = log_debug
+local log_error = log_debug
+
+local function lsp_write(session, msg)
+	session.output:write(string.format("Content-Length: %d\r\nContent-Type: application/vscode-jsonrpc; charset=utf-8\r\n\r\n", #msg))
+	session.output:write(msg)
+	log_info(session, string.format("<- %s\n", msg))
+end
+
+local function rpc_error(session, req, err, msg)
+	if not err then return end
+	err.data = msg
+	local response = {
+		jsonrpc = JSON_RPC_VERSION,
+		error = err,
+		id = (req and req.id) and req.id or cjson.null
+	}
+	-- FIXME: handle encoding error?
+	lsp_write(session, cjson.encode(response))
+end
+
+local function rpc_response(session, req, result)
+	local response = {
+		jsonrpc = JSON_RPC_VERSION,
+		result = result,
+		id = req.id and req.id or cjson.null
+	}
+	-- FIXME: handle encoding error?
+	lsp_write(session, cjson.encode(response))
+end
+
+local function rpc_notify(session, method, params)
+	local notify = {
+		jsonrpc = JSON_RPC_VERSION,
+		method = method,
+		params = params
+	}
+	-- FIXME: handle encoding error?
+	lsp_write(session, cjson.encode(notify))
+end
+
+-- returns the AST or nil if there was a parse or type checking error
+-- publishes diagnostics to the client
+local function typecheck(session, uri)
+
+	local code = session.files[uri]
+	if not code then return nil end
+	local ast, err = tlparser.parse(code, uri, session.settings.strict, session.settings.integer)
+
+	if not ast then
+		local line, col, msg = err:match("(%d+):(%d+): (.*)")
+		if not line then return nil end
+		local pos = position(line, col)
+		local diagnostics = {
+			uri = uri,
+			diagnostics = {{
+				range = range(pos, pos),
+				severity = DiagnosticSeverity.Error,
+				source = 'tlc',
+				message = msg,
+			}},
+		}
+		rpc_notify(session, 'textDocument/publishDiagnostics', diagnostics)
+		return nil
+	end
+
+	local messages = tlchecker.typecheck(ast, code, uri, session.settings.strict, session.settings.integer, false)
+	local is_warning = {
+		any = true,
+		mask = true,
+		unused = true,
+	}
+
+	local diagnostics = {}
+	local has_error = false
+
+	for _, v in ipairs(messages) do
+		local pos = position(v.l, v.c)
+		local severity
+		if not is_warning[v.tag] then
+			has_error = true
+			severity = DiagnosticSeverity.Error
+		else
+			severity = DiagnosticSeverity.Warning
+		end
+		diagnostics[#diagnostics+1] = {
+			range = range(pos, pos),
+			severity = severity,
+			source = 'tlc',
+			message = v.msg,
+		}
+	end
+
+	diagnostics = { uri = uri, diagnostics = diagnostics }
+	rpc_notify(session, 'textDocument/publishDiagnostics', diagnostics)
+
+	return has_error and nil or ast
+end
+
+-- resolve a position to an AST node
+-- FIXME: does currently only work for identifiers
+local function pos2ast(session, uri, pos)
+	local ast = typecheck(session, uri)
+	if not ast then
+		return nil, nil, {
+			code = LSP_ERROR,
+			message = "Syntax or type error exist.",
+		}
+	end
+
+	local line = pos.line+1
+	local col = pos.character+1
+	local ident
+
+	-- search identifier at requested position
+	local visitor = {
+		id = function(visitor, v)
+			if v.l == nil or v.c == nil then return end
+			if v.l == line and v.c <= col and col <= v.c + #v[1] then
+				ident = v
+				-- FIXME stop iteration
+			end
+		end
+	}
+
+	tlvisitor.visit(ast, visitor)
+
+	if not ident then
+		return nil, ast, {
+			code = 1234,
+			message = "Identifier not found."
+		}
+	end
+	return ident, ast
+end
+
+local lsp_messages = {
+	subtract = function(session, params)
+		local a = tonumber(params[1], 10)
+		local b = tonumber(params[2], 10)
+		if a == nil or b == nil then
+			return nil, JSON_RPC_ERROR.INVALID_PARAMS
+		end
+		return a - b
+	end,
+
+	['$/cancelRequest'] = function(session, params)
+		-- cancel request with id: params.id
+	end,
+
+	initialize = function(session, params)
+		return { capabilities = {
+			textDocumentSync = TextDocumentSyncKind.Full,
+			hoverProvider = true,
+			completionProvider = {
+				resolveProvider = false,
+				triggerCharacters = { ".", ":" },
+			},
+			signatureHelpProvider = {
+				triggerCharacters = { "(" },
+			},
+			definitionProvider = true,
+			referencesProvider = true,
+			documentHighlightProvider = false,
+			documentSymbolProvider = false,
+			workspaceSymbolProvider = false,
+			codeActionProvider = false,
+		--	codeLensProvider = {
+		--		resolveProvider = false,
+		--	},
+			documentFormattingProvider = false,
+			documentRangeFormattingProvider = false,
+			documentOnTypeFormattingProvider = {
+				firstTriggerCharacter = "}",
+				moreTriggerCharacter = { "end" },
+			},
+			renameProvider = true,
+		}}
+		
+	end,
+
+	initialized = function(session, params)
+		-- notification, client is ready
+	end,
+
+	shutdown = function(session, params)
+		-- session.running = false
+	end,
+
+	exit = function(session, params)
+		-- os.exit(session.running and 1 or 0)
+		os.exit(0)
+	end,
+
+	['workspace/didChangeConfiguration'] = function(session, params)
+		session.settings = {}
+		if params.settings.lua and params.settings.lua.lsp then
+			session.settings = params.settings.lua.lsp
+		end
+	end,
+
+	['textDocument/didOpen'] =  function(session, params)
+		local doc = params.textDocument
+		-- TODO: remove this? Let the client configure selectors?
+		if doc.languageId ~= "lua" then return end
+		session.files[doc.uri] = doc.text
+		typecheck(session, doc.uri)
+	end,
+
+	['textDocument/didChange'] = function(session, params)
+		local name = params.textDocument.uri
+		for i = 1, #params.contentChanges do
+			local change = params.contentChanges[i]
+			if change.range == nil and change.rangeLength == nil then
+				session.files[name] = change.text
+			else
+				-- TODO
+				local change_format = {
+					range = {
+						start = {
+							line = 0,
+							character = 0,
+						},
+						['end'] = {
+							line = 0,
+							character = 0,
+						}
+					},
+					rangeLength = 0,
+					text = "",
+				}
+				assert(false, "Increment upates are currently not supported")
+			end
+		end
+
+		typecheck(session, name)
+	end,
+
+	['textDocument/didClose'] =  function(session, params)
+		session.files[params.textDocument.uri] = nil
+	end,
+
+
+	['textDocument/didSave'] = function(session, params)
+		-- params.textDocument.uri
+		local name = params.textDocument.uri
+		if params.text then
+			session.files[name] = params.text
+		end
+		typecheck(session, name)
+	end,
+
+	['workspace/didChangeWatchedFiles'] = function(session, params)
+		for _, fileEvent in ipairs(params.changes) do
+			-- fileEvent.uri
+			-- fileEvent.type
+		end
+	end,
+
+	['textDocument/completion'] = function(session, params)
+		params = {
+			textDocument = {
+				uri = ""
+			},
+			position = {
+				line = 0,
+				character = 0,
+			}
+		}
+
+		return {
+			{ label = "foo" },
+			{ label = "bar" },
+		}
+	end,
+
+	['textDocument/hover'] = function(session, params)
+		-- TODO LuaDoc integration?
+		local node, ast, err = pos2ast(session, params.textDocument.uri, params.position)
+		if not node then return nil, err end
+		return { contents = string.format("%s:%s", node[1], node.type[1]) }
+	end,
+
+	['textDocument/signatureHelp'] = function(session, params)
+		-- TODO needs LuaDoc integration?
+	end,
+
+	['textDocument/rename'] = function(session, params)
+
+		local ident, ast, err = pos2ast(session, params.textDocument.uri, params.position)
+		if not ident then return nil, err end
+
+		-- rename all existing occrences
+		local edits = {}
+		local newName = params.newName
+
+		local visitor = {
+			id = function(visitor, v)
+				if v[1] == ident[1] and v.scope == ident.scope then
+					edits[#edits+1] = {
+						range = range(position(v.l, v.c), position(v.l, v.c + #v[1])),
+						newText = newName,
+					}
+				end
+			end
+		}
+
+		tlvisitor.visit(ast, visitor)
+
+		return {
+			-- TODO support documentChanges which seems to be preferred
+			changes = { [params.textDocument.uri] = edits },
+		}
+	end,
+
+	['textDocument/references'] = function(session, params)
+
+		local uri = params.textDocument.uri
+		local ident, ast, err = pos2ast(session, uri, params.position)
+		if not ident then return nil, err end
+
+		-- rename all existing occrences
+		local refs = {}
+
+		local visitor = {
+			id = function(visitor, v)
+				if v[1] == ident[1] and v.scope == ident.scope then
+					-- TODO respect includeDeclaration property?
+					refs[#refs+1] = {
+						uri = uri,
+						range = range(position(v.l, v.c), position(v.l, v.c + #v[1])),
+					}
+				end
+			end
+		}
+
+		tlvisitor.visit(ast, visitor)
+
+		return refs
+	end,
+
+	['textDocument/definition'] = function(session, params)
+
+		local uri = params.textDocument.uri
+		local ident, ast, err = pos2ast(session, uri, params.position)
+		if not ident then return nil, err end
+
+		local ref
+
+		local visitor = {
+			id = function(visitor, v)
+				if v[1] == ident[1] and v.scope == ident.scope then
+					-- TODO stop iteration
+					if ref then return end
+					ref = {
+						uri = uri,
+						range = range(position(v.l, v.c), position(v.l, v.c + #v[1])),
+					}
+				end
+			end
+		}
+
+		tlvisitor.visit(ast, visitor)
+
+		return ref
+	end,
+}
+
+local function handle_message(session, msg)
+	log_info(session, string.format("-> %s\n", msg))
+
+	local rpc, err = cjson.decode(msg)
+	if not rpc then
+		return rpc_error(session, rpc, JSON_RPC_ERROR.PARSE, "JSON decode error: " .. err)
+	end
+
+	if rpc.jsonrpc ~= JSON_RPC_VERSION then
+		return rpc_error(session, rpc, JSON_RPC_ERROR.REQUEST, "Invalid version")
+	end
+
+	if type(rpc.method) ~= "string" then
+		return rpc_error(session, rpc, JSON_RPC_ERROR.REQUEST, "Invalid method")
+	end
+
+	if rpc.params and type(rpc.params) ~= "table" then
+		return rpc_error(session, rpc, JSON_RPC_ERROR.REQUEST, "Invalid params")
+	end
+
+	local method = lsp_messages[rpc.method]
+	if not method then
+		-- unknown requests or notifications starting with $/ can be ignored
+		if rpc.method:sub(1, 2) ~= "$/" then
+			rpc_error(session, rpc, JSON_RPC_ERROR.UNKNOWN_METHOD, rpc.method)
+		end
+		return
+	end
+
+	local result, err = method(session, rpc.params)
+	-- notifications do not have ids and *must* not be replied to
+	if rpc.id then
+		if result then
+			return rpc_response(session, rpc, result)
+		else
+			return rpc_error(session, rpc, err);
+		end
+	end
+end
+
+local function serve(input, output)
+
+	local session = {
+		input = input,
+		output = output,
+		buf = "", len = 0,
+		files = {},
+	}
+
+	input:read_start(function(err, chunk)
+
+		if err then
+			log_error(session, string.format("I/O error: %s\n", err))
+			input:close()
+			if input ~= output then output:close() end
+			return
+		end
+
+		if not chunk then
+			log_info(session, "EOF\n")
+			input:close()
+			if input ~= output then output:close() end
+			return
+		end
+
+		-- FIXME: avoid/reduce string operations?
+		session.buf = session.buf .. chunk
+
+		while #session.buf > 0 do
+
+			if session.len == 0 then
+				-- Parse LSP Content-Length header
+				local s, e = session.buf:find("\r\n\r\n")
+				if not s then return end
+				local headers = session.buf:sub(1, s+1)
+				local len = headers:match("Content%-Length:[ ]+(%d+)")
+				if not len then return end
+				session.len = tonumber(len)
+				session.buf = session.buf:sub(e+1)
+			end
+
+			if #session.buf < session.len then
+				-- Wait until more data arrives
+				return
+			end
+			
+			local msg = session.buf:sub(1, session.len)
+			session.buf = session.buf:sub(session.len+1)
+			session.len = 0
+			handle_message(session, msg)
+		end
+		
+	end)
+end
+
+local function usage()
+	io.stderr:write("usage: lua-lsp [-p port] [-d log]\n")
+	os.exit(1)
+end
+
+local function main()
+	local host = "127.0.0.1"
+	local port = nil;
+
+	local i = 1
+	while i <= #arg do
+		if arg[i] == '-p' then
+			if i+1 <= #arg then
+				port = tonumber(arg[i+1])
+				if port then i = i + 1 end
+			end
+			if not port then port = 0 end
+		elseif arg[i] == '-d' then
+			if not (i+1 <= #arg) then usage() end
+			i = i + 1
+			log, err = io.open(arg[i], "w+")
+			assert(log, err)
+		else
+			usage()
+		end
+		i = i + 1
+	end
+	
+	if port then
+		
+		local server = uv.new_tcp()
+		server:bind(host, port)
+
+		server:listen(128, function(err)
+			-- Make sure there was no problem setting up listen
+			assert(not err, err)
+
+			-- Accept the client
+			local client = uv.new_tcp()
+			server:accept(client)
+			serve(client, client)
+		end)
+
+		log_info(nil, "TypedLua LSP server listening on port " .. server:getsockname().port .. "\n")
+	else
+		local stdin = uv.new_pipe(false)
+		uv.pipe_open(stdin, 0)
+		local stdout = uv.new_pipe(false)
+		uv.pipe_open(stdout, 1)
+
+		serve(stdin, stdout)
+
+		log_info(nil, "TypedLua LSP server listening stdin/stdout\n")
+	end
+
+	uv.run()
+end
+
+main()
+
